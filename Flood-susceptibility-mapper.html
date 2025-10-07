@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flood Susceptibility Mapper (Final)</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; }
+  h1 { font-size: 20px; margin-bottom: 8px; }
+  .controls, .legend, .map-controls { margin-bottom: 12px; }
+  canvas { border: 2px solid #333; border-radius: 8px; display:block; margin-top:10px; background: #fff; cursor: default; }
+  .btn { background:#0b67ff; color:#fff; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; margin-top:6px; }
+  label { display:inline-block; margin:6px 8px 0 0; font-size:14px; }
+  .legend { text-align:left; max-width: 1000px; margin-top: 12px; }
+  .legend .legend-block { background:#fff; padding:8px; border-radius:6px; margin-bottom:8px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+  .legend .rows { margin-top:8px; }
+  .legend .row { display:flex; gap:6px; margin-bottom:6px; align-items:center; }
+  .map-controls input[type="number"] { width:70px; }
+  input[type="range"] { vertical-align: middle; }
+  #hoverInfo { margin-top:8px; font-size:14px; min-height:20px; }
+</style>
+</head>
+<body>
+<h1>Flood Susceptibility Mapper (Final)</h1>
+
+<div class="controls">
+  <label>Upload 4 map layers (Elevation, Soil, Land Cover, etc.)</label><br>
+  <input type="file" id="map1" accept="image/*">
+  <input type="file" id="map2" accept="image/*">
+  <input type="file" id="map3" accept="image/*">
+  <input type="file" id="map4" accept="image/*"><br>
+
+  <label>Grid Rows: <input type="number" id="rows" value="10" min="1"></label>
+  <label>Grid Cols: <input type="number" id="cols" value="10" min="1"></label>
+  <button class="btn" onclick="applyGrid()">Apply Grid</button>
+</div>
+
+<canvas id="mainCanvas" width="900" height="600"></canvas>
+<div id="hoverInfo">Hover a grid cell to see composition</div>
+
+<div style="margin-top:8px;">
+  <button class="btn" onclick="exportCSV()">Export Cell Percentages (CSV)</button>
+  <button class="btn" onclick="saveMap()">Save Map as PNG</button>
+  <button class="btn" onclick="toggleGridAdjustment()">Toggle Grid Line Adjustment</button>
+</div>
+
+<!-- Legend Section -->
+<div class="legend" id="legendRoot">
+  <h2>Legends (per layer)</h2>
+  <div id="legendsContainer"></div>
+</div>
+
+<script>
+/* -------------------------
+   Core canvases and config
+   ------------------------- */
+const canvas = document.getElementById('mainCanvas');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+// Offscreen buffer for sampling (draw images here, no overlays)
+const offscreen = document.createElement('canvas');
+offscreen.width = canvas.width;
+offscreen.height = canvas.height;
+const offCtx = offscreen.getContext('2d');
+offCtx.imageSmoothingEnabled = false;
+
+/* State */
+let rows = 10, cols = 10;
+let images = []; // Image objects (or undefined)
+let imageSettings = []; // per-layer settings
+let eyedropTarget = null;
+
+let verticalLines = [];
+let horizontalLines = [];
+let draggingLine = null;
+let dragType = null;
+let gridAdjustment = false;
+let hoveredCell = null; // {left, top, width, height, row, col}
+
+/* layer names (display only) */
+const layerNames = ['Elevation', 'Soil', 'Land Cover', 'Flood Elevation'];
+const legendContainer = document.getElementById('legendsContainer');
+
+/* Initialize legend blocks & settings for 4 layers */
+for (let i = 1; i <= 4; i++) {
+  imageSettings.push({
+    baseZoom: 1,
+    displayZoom: 1,
+    zoom: 1,
+    offsetX: 0,
+    offsetY: 0,
+    opacity: 1
+  });
+
+  const div = document.createElement('div');
+  div.className = 'legend-block';
+  div.dataset.layer = i;
+  div.innerHTML = `
+    <strong>Map ${i} — ${layerNames[i-1]}</strong>
+    <div class="map-controls" style="margin-top:6px;">
+      Zoom: <input type="number" step="0.1" value="1" min="0.1" onchange="updateZoom(${i-1}, this.value)">
+      OffsetX: <input type="number" value="0" onchange="updateOffset(${i-1}, 'x', this.value)">
+      OffsetY: <input type="number" value="0" onchange="updateOffset(${i-1}, 'y', this.value)">
+      Opacity: <input type="range" min="0" max="1" step="0.05" value="1" onchange="updateOpacity(${i-1}, this.value)">
+      <span id="opacityVal${i-1}">1.0</span>
+    </div>
+    <div class="rows"></div>
+    <button class="btn" onclick="addLegendRow(${i})">+ Add Legend</button>
+    <button class="btn" style="background:#444" onclick="showOnlyLayer(${i-1})">Show Only This Layer</button>
+    <button class="btn" style="background:#666" onclick="restoreAllLayers()">Restore Layers</button>
+  `;
+  legendContainer.appendChild(div);
+}
+
+/* File upload handlers */
+['map1','map2','map3','map4'].forEach((id, i) => {
+  document.getElementById(id).addEventListener('change', e => {
+    if (e.target.files && e.target.files[0]) loadImage(e.target.files[0], i);
+  });
+});
+
+/* -------------------------
+   Image loading & fitting
+   ------------------------- */
+function loadImage(file, index) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      // auto-fit (contain) into canvas, preserve aspect ratio
+      const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+      const newW = img.width * scale;
+      const newH = img.height * scale;
+      const offsetX = (canvas.width - newW) / 2;
+      const offsetY = (canvas.height - newH) / 2;
+
+      images[index] = img;
+      const s = imageSettings[index];
+      s.baseZoom = scale;
+      s.displayZoom = 1;
+      s.zoom = s.baseZoom * s.displayZoom;
+      s.offsetX = offsetX;
+      s.offsetY = offsetY;
+      s.opacity = 1;
+
+      // update UI inputs for this layer to reflect fitted values
+      const block = document.querySelector(`.legend-block[data-layer="${index+1}"]`);
+      if (block) {
+        const nums = block.querySelectorAll('input[type="number"]');
+        if (nums[0]) nums[0].value = s.displayZoom.toFixed(2); // zoom control (relative)
+        if (nums[1]) nums[1].value = Math.round(s.offsetX);
+        if (nums[2]) nums[2].value = Math.round(s.offsetY);
+        const range = block.querySelector('input[type="range"]');
+        if (range) range.value = s.opacity;
+        const span = document.getElementById(`opacityVal${index}`);
+        if (span) span.innerText = s.opacity.toFixed(2);
+      }
+
+      redraw();
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+/* -------------------------
+   Offscreen draw (images only)
+   ------------------------- */
+function renderOffscreen() {
+  offCtx.clearRect(0, 0, offscreen.width, offscreen.height);
+  images.forEach((img, i) => {
+    if (!img) return;
+    const s = imageSettings[i];
+    offCtx.globalAlpha = s.opacity || 1;
+    offCtx.drawImage(img, s.offsetX, s.offsetY, img.width * s.zoom, img.height * s.zoom);
+  });
+  offCtx.globalAlpha = 1;
+}
+
+/* -------------------------
+   Main redraw
+   ------------------------- */
+function redraw() {
+  // render images to offscreen buffer (clean)
+  renderOffscreen();
+
+  // copy offscreen to visible canvas
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(offscreen, 0, 0);
+
+  // draw grid and overlay highlight
+  drawGrid();
+  drawHoveredCellOverlay();
+}
+
+/* -------------------------
+   Grid creation & drawing
+   ------------------------- */
+function applyGrid() {
+  rows = Math.max(1, parseInt(document.getElementById('rows').value));
+  cols = Math.max(1, parseInt(document.getElementById('cols').value));
+
+  verticalLines = [];
+  horizontalLines = [];
+
+  const w = canvas.width, h = canvas.height;
+  const cellW = w / cols, cellH = h / rows;
+
+  for (let c = 0; c <= cols; c++) verticalLines.push(c * cellW);
+  for (let r = 0; r <= rows; r++) horizontalLines.push(r * cellH);
+
+  hoveredCell = null;
+  redraw();
+}
+
+function drawGrid() {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+  ctx.lineWidth = 1;
+
+  // horizontal lines
+  horizontalLines.forEach(y => {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(canvas.width, y);
+    ctx.stroke();
+  });
+
+  // vertical lines
+  verticalLines.forEach(x => {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+    ctx.stroke();
+  });
+
+  ctx.restore();
+}
+
+/* Hover overlay */
+function drawHoveredCellOverlay() {
+  if (!hoveredCell) return;
+  ctx.save();
+  ctx.fillStyle = 'rgba(255, 255, 0, 0.12)';
+  ctx.fillRect(hoveredCell.left, hoveredCell.top, hoveredCell.width, hoveredCell.height);
+  ctx.strokeStyle = 'rgba(255,165,0,0.9)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(hoveredCell.left + 0.5, hoveredCell.top + 0.5, hoveredCell.width - 1, hoveredCell.height - 1);
+  ctx.restore();
+}
+
+/* -------------------------
+   Adjustments (zoom/offset/opacity)
+   ------------------------- */
+function updateZoom(layer, value) {
+  const s = imageSettings[layer];
+  const v = parseFloat(value) || 1;
+  s.displayZoom = v;
+  s.zoom = (s.baseZoom || 1) * s.displayZoom;
+  // update drawn offset if desired (keeps center)
+  redraw();
+}
+
+function updateOffset(layer, axis, value) {
+  const s = imageSettings[layer];
+  const v = parseFloat(value) || 0;
+  if (axis === 'x') s.offsetX = v;
+  else s.offsetY = v;
+  redraw();
+}
+
+function updateOpacity(layer, value) {
+  const s = imageSettings[layer];
+  s.opacity = parseFloat(value) || 1;
+  const span = document.getElementById(`opacityVal${layer}`);
+  if (span) span.innerText = s.opacity.toFixed(2);
+  redraw();
+}
+
+/* -------------------------
+   Legend inputs + eyedropper
+   ------------------------- */
+function addLegendRow(layer) {
+  const block = document.querySelector(`.legend-block[data-layer="${layer}"] .rows`);
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = `
+    <input class="colorKey" placeholder="#HEX (e.g. #FF0000)" data-layer="${layer}">
+    <input class="colorName" placeholder="Category name">
+    <button class="btn" style="background:#888" onclick="activateEyedropper(this)">Pick</button>
+  `;
+  block.appendChild(row);
+}
+
+function activateEyedropper(btn) {
+  // the colorKey input will be filled by the next click on canvas
+  eyedropTarget = btn.parentElement.querySelector('.colorKey');
+  canvas.style.cursor = 'crosshair';
+}
+
+// Use offscreen sampling so overlays don't affect color pick
+canvas.addEventListener('click', e => {
+  if (!eyedropTarget) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+  const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+
+  try {
+    const pixel = offCtx.getImageData(x, y, 1, 1).data;
+    const hex = rgbToHex(pixel[0], pixel[1], pixel[2]);
+    eyedropTarget.value = hex;
+  } catch (err) {
+    console.error('Pick failed', err);
+  }
+
+  eyedropTarget = null;
+  canvas.style.cursor = 'default';
+});
+
+/* -------------------------
+   Color helpers & matching
+   ------------------------- */
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map(x => {
+    const v = Math.round(Math.max(0, Math.min(255, x)));
+    return v.toString(16).padStart(2, '0').toUpperCase();
+  }).join('');
+}
+
+function hexToRgb(hex) {
+  try {
+    const h = hex.replace('#','');
+    const bigint = parseInt(h, 16);
+    return { r: (bigint >> 16) & 255, g: (bigint >> 8) & 255, b: bigint & 255 };
+  } catch (e) {
+    return { r:0, g:0, b:0 };
+  }
+}
+
+function colorDistance(c1, c2) {
+  // Euclidean distance in RGB
+  return Math.sqrt(
+    (c1[0]-c2[0])**2 + (c1[1]-c2[1])**2 + (c1[2]-c2[2])**2
+  );
+}
+
+function getLayerLegends() {
+  const legends = {};
+  document.querySelectorAll('.legend-block').forEach(block => {
+    const layer = block.dataset.layer; // string like "1"
+    legends[layer] = {};
+    block.querySelectorAll('.row').forEach(r => {
+      const keyInput = r.querySelector('.colorKey');
+      const nameInput = r.querySelector('.colorName');
+      if (!keyInput || !nameInput) return;
+      const key = keyInput.value.trim().toUpperCase();
+      const name = nameInput.value.trim();
+      if (key && name && /^#([0-9A-F]{6})$/i.test(key)) {
+        legends[layer][key] = name;
+      }
+    });
+  });
+  return legends;
+}
+
+function findClosestLegendColor(pixelRgb, legends, tolerance = 40) {
+  // legends: { layer: { "#HEX": "Category", ...}, ...}
+  let best = null;
+  let minDist = Infinity;
+  for (const layer in legends) {
+    for (const hex in legends[layer]) {
+      const rgb = hexToRgb(hex);
+      const dist = colorDistance(pixelRgb, [rgb.r, rgb.g, rgb.b]);
+      if (dist < minDist) {
+        minDist = dist;
+        best = { layer: layer, hex: hex, category: legends[layer][hex] };
+      }
+    }
+  }
+  return (minDist <= tolerance) ? best : null;
+}
+
+/* -------------------------
+   Hover info (percentages) & highlight
+   ------------------------- */
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+  // find which cell the mouse is over (using current lines)
+  let col = 0;
+  for (let i = 0; i < verticalLines.length - 1; i++) {
+    if (x >= verticalLines[i] && x < verticalLines[i+1]) { col = i; break; }
+    if (i === verticalLines.length - 2 && x >= verticalLines[i+1]) col = i;
+  }
+  let row = 0;
+  for (let j = 0; j < horizontalLines.length - 1; j++) {
+    if (y >= horizontalLines[j] && y < horizontalLines[j+1]) { row = j; break; }
+    if (j === horizontalLines.length - 2 && y >= horizontalLines[j+1]) row = j;
+  }
+
+  // compute integer cell extents
+  const left = Math.max(0, Math.floor(verticalLines[col]));
+  const top = Math.max(0, Math.floor(horizontalLines[row]));
+  const right = Math.min(canvas.width, Math.floor(verticalLines[col+1]));
+  const bottom = Math.min(canvas.height, Math.floor(horizontalLines[row+1]));
+  const w = Math.max(1, right - left);
+  const h = Math.max(1, bottom - top);
+
+  // update hoveredCell for overlay drawing
+  hoveredCell = { left, top, width: w, height: h, row, col };
+
+  // sample pixels from offscreen buffer
+  let imgData;
+  try {
+    imgData = offCtx.getImageData(left, top, w, h).data;
+  } catch (err) {
+    // if sampling fails, clear info
+    document.getElementById('hoverInfo').textContent = '';
+    return;
+  }
+
+  const legends = getLayerLegends();
+  const counts = {};
+  const totalPixels = w * h;
+  // iterate through pixels
+  for (let i = 0; i < imgData.length; i += 4) {
+    const pixel = [imgData[i], imgData[i+1], imgData[i+2]];
+    const match = findClosestLegendColor(pixel, legends, 40); // tolerance 40 (adjust if needed)
+    if (match) {
+      const key = `${match.layer}:${match.category}`;
+      counts[key] = (counts[key] || 0) + 1;
+    }
+  }
+
+  // build sorted percentages
+  const entries = Object.entries(counts).map(([k,v]) => [k, (v/totalPixels)*100]);
+  entries.sort((a,b)=> b[1]-a[1]);
+
+  // create info string
+  let info = `Cell [R${row+1},C${col+1}]: `;
+  if (entries.length) {
+    info += entries.slice(0,5).map(([k,p])=>{
+      // k format "layer:category"
+      const [layerIdx, category] = k.split(':');
+      const layerName = layerNames[Number(layerIdx)-1] || `L${layerIdx}`;
+      return `${layerName} - ${category} (${p.toFixed(1)}%)`;
+    }).join(' | ');
+  } else {
+    info += 'Unclassified / No match';
+  }
+  document.getElementById('hoverInfo').textContent = info;
+
+  // redraw overlay
+  redraw();
+});
+
+/* -------------------------
+   Drag individual grid lines
+   ------------------------- */
+function toggleGridAdjustment() {
+  gridAdjustment = !gridAdjustment;
+  alert(gridAdjustment ? "Individual Grid Line Adjustment: ON" : "OFF");
+  canvas.style.cursor = gridAdjustment ? 'col-resize' : 'default';
+}
+
+// detect mouse down for dragging a specific line (only when gridAdjustment is ON)
+canvas.addEventListener('mousedown', e => {
+  if (!gridAdjustment) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+  // vertical lines
+  for (let i = 0; i < verticalLines.length; i++) {
+    if (Math.abs(x - verticalLines[i]) < 6) {
+      draggingLine = i;
+      dragType = 'v';
+      return;
+    }
+  }
+  // horizontal lines
+  for (let j = 0; j < horizontalLines.length; j++) {
+    if (Math.abs(y - horizontalLines[j]) < 6) {
+      draggingLine = j;
+      dragType = 'h';
+      return;
+    }
+  }
+});
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+  // if currently dragging a line, update its position (clamped to neighbors)
+  if (draggingLine !== null && dragType) {
+    const minGap = 5;
+    if (dragType === 'v') {
+      const i = draggingLine;
+      const leftBound = (i > 0) ? verticalLines[i-1] + minGap : minGap;
+      const rightBound = (i < verticalLines.length - 1) ? verticalLines[i+1] - minGap : canvas.width - minGap;
+      verticalLines[i] = Math.max(leftBound, Math.min(rightBound, x));
+    } else { // 'h'
+      const j = draggingLine;
+      const topBound = (j > 0) ? horizontalLines[j-1] + minGap : minGap;
+      const bottomBound = (j < horizontalLines.length - 1) ? horizontalLines[j+1] - minGap : canvas.height - minGap;
+      horizontalLines[j] = Math.max(topBound, Math.min(bottomBound, y));
+    }
+    // refresh overlay and grid
+    redraw();
+    return;
+  }
+
+  // change cursor when hovering near a line (only when gridAdjustment true)
+  if (gridAdjustment) {
+    let near = false;
+    for (let v of verticalLines) if (Math.abs(x-v) < 6) near = true;
+    for (let h of horizontalLines) if (Math.abs(y-h) < 6) near = true;
+    canvas.style.cursor = near ? 'col-resize' : 'default';
+  }
+});
+
+canvas.addEventListener('mouseup', ()=>{ draggingLine = null; dragType = null; });
+canvas.addEventListener('mouseleave', ()=>{ draggingLine = null; dragType = null; });
+
+/* -------------------------
+   CSV Export: per cell percentages and breakdown
+   ------------------------- */
+function exportCSV() {
+  const legends = getLayerLegends();
+  let csv = "Row,Col,TopLayer,TopCategory,TopPercent,AllBreakdown\n";
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      // cell bounds
+      const left = Math.max(0, Math.floor(verticalLines[c]));
+      const top = Math.max(0, Math.floor(horizontalLines[r]));
+      const right = Math.max(0, Math.floor(verticalLines[c+1]));
+      const bottom = Math.max(0, Math.floor(horizontalLines[r+1]));
+      const w = Math.max(1, right - left);
+      const h = Math.max(1, bottom - top);
+
+      let imgData;
+      try {
+        imgData = offCtx.getImageData(left, top, w, h).data;
+      } catch (err) {
+        imgData = null;
+      }
+      if (!imgData) {
+        csv += `${r+1},${c+1},N/A,Unclassified,0%,None\n`;
+        continue;
+      }
+
+      const counts = {};
+      for (let i = 0; i < imgData.length; i += 4) {
+        const pixel = [imgData[i], imgData[i+1], imgData[i+2]];
+        const match = findClosestLegendColor(pixel, legends, 40);
+        if (match) {
+          const key = `${match.layer}:${match.category}`;
+          counts[key] = (counts[key] || 0) + 1;
+        }
+      }
+
+      const totalPixels = w * h;
+      const entries = Object.entries(counts).map(([k,v]) => [k, (v/totalPixels)*100]);
+      entries.sort((a,b)=> b[1]-a[1]);
+
+      if (entries.length === 0) {
+        csv += `${r+1},${c+1},N/A,Unclassified,0%,None\n`;
+      } else {
+        const [topKey, pct] = entries[0];
+        const [layerIdx, category] = topKey.split(':');
+        const topLayerName = layerNames[Number(layerIdx)-1] || `L${layerIdx}`;
+        const breakdown = entries.map(([k,p]) => {
+          const [li, cat] = k.split(':');
+          const ln = layerNames[Number(li)-1] || `L${li}`;
+          return `${ln}-${cat} (${p.toFixed(1)}%)`;
+        }).join('; ');
+        csv += `${r+1},${c+1},${topLayerName},${category},${pct.toFixed(1)}%,"${breakdown}"\n`;
+      }
+    }
+  }
+
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'cell_percentages.csv';
+  a.click();
+}
+
+/* -------------------------
+   Save map as PNG (combines everything visible)
+   ------------------------- */
+function saveMap(){
+  // Ensure main canvas has latest visuals
+  redraw();
+  const link = document.createElement('a');
+  link.download = 'flood_map.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+}
+
+/* -------------------------
+   Utility: show only specific layer (helpful when picking legends)
+   ------------------------- */
+function showOnlyLayer(index) {
+  imageSettings.forEach((s,i)=> s.opacity = (i===index ? 1 : 0));
+  // update UI opacity sliders to reflect change
+  document.querySelectorAll('.legend-block').forEach((blk, i)=>{
+    const r = blk.querySelector('input[type="range"]');
+    if (r) r.value = imageSettings[i].opacity;
+    const span = document.getElementById(`opacityVal${i}`);
+    if (span) span.innerText = imageSettings[i].opacity.toFixed(2);
+  });
+  redraw();
+}
+function restoreAllLayers(){
+  imageSettings.forEach(s=> s.opacity = 1);
+  document.querySelectorAll('.legend-block').forEach((blk, i)=>{
+    const r = blk.querySelector('input[type="range"]');
+    if (r) r.value = 1;
+    const span = document.getElementById(`opacityVal${i}`);
+    if (span) span.innerText = '1.00';
+  });
+  redraw();
+}
+
+/* -------------------------
+   Init default grid and first redraw
+   ------------------------- */
+applyGrid();
+redraw();
+
+</script>
+</body>
+</html>
